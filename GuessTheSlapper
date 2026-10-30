@@ -1,7 +1,7 @@
--- Slap Assistant v2 (Delta / Luau)
--- UI + Auto Slap (power bisa dipilih) + Auto Dodge + Pelacak pelaku slap
+-- Slap Assistant v3 (Delta / Luau)
+-- UI + Auto Slap + Auto Dodge (mode Reflex / Human) + Pelacak pelaku slap + setelan tersimpan
 -- Buka/tutup UI: RightControl atau tombol bulat "S". Hapus total: tombol X di window.
--- Script ini menggantikan AutoSlapDodge.lua, jangan dijalankan bersamaan.
+-- Instance lama (v2 / AutoSlapDodge) otomatis ditutup saat v3 dijalankan.
 
 local env = (getgenv and getgenv()) or _G
 if env.__SlapAssistant then pcall(env.__SlapAssistant.Unload) end
@@ -22,20 +22,66 @@ local function keep(c)
 	conns[#conns + 1] = c
 	return c
 end
+-- jalankan fn nanti, batal kalau script sudah di-unload; error ditelan
+local function later(t, fn)
+	task.delay(t, function()
+		if alive then pcall(fn) end
+	end)
+end
 
-local events = RS:WaitForChild("events")
+local events = RS:WaitForChild("events", 10)
+if not events then
+	warn("[SlapAssistant] folder 'events' tidak ketemu - ini bukan game Guess the Slapper?")
+	return
+end
 local R = {}
 for _, n in ipairs({"SendSlap", "Dodge", "DodgePrompt", "DodgeResult", "SlapPercent", "Guess", "Resety"}) do
-	R[n] = events:WaitForChild(n)
+	R[n] = events:WaitForChild(n, 5)
+	if not R[n] then
+		warn("[SlapAssistant] remote '" .. n .. "' tidak ketemu")
+		return
+	end
 end
 
 ---------------------------------------------------------------- STATE
-local S = {
-	autoSlap = true, autoDodge = true, autoGuess = false,
-	worldHL = true, notify = true,
-	mode = "Fixed", power = 100, rmin = 85, rmax = 100, trigger = 90,
-	dMin = 40, dMax = 90, dChance = 100,
-}
+local S
+do
+	local raw = {
+		autoSlap = true, autoDodge = true, autoGuess = false,
+		worldHL = true, notify = true,
+		mode = "Fixed", power = 100, rmin = 85, rmax = 100, trigger = 90,
+		dodgeMode = "Reflex", dMin = 40, dMax = 90, dChance = 100,
+		accent = "Indigo",
+	}
+	local FILE, queued = "SlapAssistant_v3.json", false
+	local function save()
+		if not writefile or queued then return end
+		queued = true
+		task.delay(0.8, function()
+			queued = false
+			pcall(function() writefile(FILE, game:GetService("HttpService"):JSONEncode(raw)) end)
+		end)
+	end
+	if isfile and readfile then
+		pcall(function()
+			if not isfile(FILE) then return end
+			local data = game:GetService("HttpService"):JSONDecode(readfile(FILE))
+			for k, v in pairs(raw) do
+				if type(data[k]) == type(v) then raw[k] = data[k] end
+			end
+		end)
+	end
+	if raw.mode ~= "Fixed" and raw.mode ~= "Random" and raw.mode ~= "Perfect" then raw.mode = "Fixed" end
+	if raw.dodgeMode ~= "Reflex" and raw.dodgeMode ~= "Human" then raw.dodgeMode = "Reflex" end
+	-- setiap S.x = v otomatis tersimpan
+	S = setmetatable({}, {
+		__index = raw,
+		__newindex = function(_, k, v)
+			raw[k] = v
+			save()
+		end,
+	})
+end
 local stats = {slaps = 0, dodgeOk = 0, dodgeFail = 0, prompts = 0}
 
 ---------------------------------------------------------------- THEME + HELPERS
@@ -53,6 +99,9 @@ local ACCENTS = {
 	{"Amber", Color3.fromRGB(245, 158, 11)},
 }
 local WHITE = Color3.new(1, 1, 1)
+for _, a in ipairs(ACCENTS) do
+	if a[1] == S.accent then T.accent = a[2] end
+end
 local FB, FM = Enum.Font.GothamBold, Enum.Font.GothamMedium
 
 local accentFns = {}
@@ -67,6 +116,7 @@ end
 
 local function mk(class, props, parent)
 	local o = Instance.new(class)
+	if o:IsA("GuiObject") then o.BorderSizePixel = 0 end -- buang border hitam bawaan Roblox
 	if props then
 		for k, v in pairs(props) do o[k] = v end
 	end
@@ -97,17 +147,38 @@ local function label(parent, text, size, color, font, xalign)
 end
 local function ts() return os.date("%H:%M:%S") end
 local function pct(v) return math.floor(v * 100 + 0.5) end
+local function getPing()
+	local ok, v = pcall(function()
+		return game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+	end)
+	return (ok and tonumber(v)) and math.floor(v + 0.5) or 0
+end
 
 ---------------------------------------------------------------- GAME ACCESS
+local cache = {}
 local function gameGui()
+	local g = cache.gui
+	if g and g.Parent then return g end
 	local pg = LP:FindFirstChild("PlayerGui")
-	return pg and pg:FindFirstChild("ScreenGui")
+	g = pg and pg:FindFirstChild("ScreenGui")
+	cache.gui, cache.meter, cache.bar, cache.btn = g, nil, nil, nil
+	return g
 end
 local function gameMeter()
 	local g = gameGui()
-	local m = g and g:FindFirstChild("meter")
-	local c = m and m:FindFirstChild("color")
-	return m, c and c:FindFirstChild("bar"), g and g:FindFirstChild("dodgebut")
+	if not g then return nil end
+	local m, bar, btn = cache.meter, cache.bar, cache.btn
+	if not (m and m.Parent and bar and bar.Parent) then
+		m = g:FindFirstChild("meter")
+		local c = m and m:FindFirstChild("color")
+		bar = c and c:FindFirstChild("bar")
+		cache.meter, cache.bar = m, bar
+	end
+	if not (btn and btn.Parent) then
+		btn = g:FindFirstChild("dodgebut")
+		cache.btn = btn
+	end
+	return m, bar, btn
 end
 -- tekan tombol lewat handler game sendiri
 local function pressBtn(btn, sig)
@@ -149,6 +220,7 @@ local SW = W < 420 and 88 or 112
 local win = mk("Frame", {Name = "Window", Size = UDim2.fromOffset(W, H), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), BackgroundColor3 = T.bg, ClipsDescendants = true}, gui)
 corner(win, 12)
 stroke(win, T.stroke, 1)
+mk("UIScale", {Scale = 1}, win)
 
 local function makeDraggable(handle, target, onTap)
 	local dragging, dragInput, dragStart, startPos, moved = false, nil, nil, nil, false
@@ -175,12 +247,17 @@ end
 
 -- top bar
 local top = mk("Frame", {Size = UDim2.new(1, 0, 0, 40), BackgroundColor3 = T.side}, win)
+do
+	local line = mk("Frame", {Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2), BackgroundColor3 = T.accent}, top)
+	mk("UIGradient", {Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 0.9)})}, line)
+	onAccent(function() line.BackgroundColor3 = T.accent end)
+end
 local dot = mk("Frame", {Size = UDim2.fromOffset(10, 10), Position = UDim2.fromOffset(14, 15)}, top)
 corner(dot, 5)
 onAccent(function() dot.BackgroundColor3 = T.accent end)
 local ttl = label(top, "SLAP ASSISTANT", 14, T.text, FB)
 ttl.Position, ttl.Size = UDim2.fromOffset(32, 0), UDim2.new(0, 120, 1, 0)
-local ver = label(top, "v2.0", 11, T.sub)
+local ver = label(top, "v3.0", 11, T.sub)
 ver.Position, ver.Size = UDim2.fromOffset(150, 0), UDim2.new(0, 40, 1, 0)
 local dragZone = mk("Frame", {Size = UDim2.new(1, -80, 1, 0), BackgroundTransparency = 1, ZIndex = 5}, top)
 makeDraggable(dragZone, win)
@@ -215,7 +292,17 @@ local function newPage(name)
 	return p
 end
 local function showTab(name)
-	for n, p in pairs(pages) do p.Visible = (n == name) end
+	for n, p in pairs(pages) do
+		if n == name then
+			if not p.Visible then
+				p.Position = UDim2.fromOffset(0, 10)
+				p.Visible = true
+				tween(p, 0.18, {Position = UDim2.fromOffset(0, 0)})
+			end
+		else
+			p.Visible = false
+		end
+	end
 	for n, t in pairs(tabBtns) do t.paint(n == name) end
 end
 for i, name in ipairs({"Dashboard", "Slap", "Dodge", "Tracker", "Log", "Setelan"}) do
@@ -523,7 +610,7 @@ mk("UIGridLayout", {CellSize = UDim2.new(0.25, -6, 1, 0), CellPadding = UDim2.fr
 local setSlaps = StatCard(grid, "Slap terkirim", 1)
 local setOk = StatCard(grid, "Dodge sukses", 2)
 local setFail = StatCard(grid, "Dodge gagal", 3)
-local setPow = StatCard(grid, "Power akhir", 4)
+local setPow = StatCard(grid, "Rate dodge", 4)
 MeterWidget(pDash)
 local pillRow = mk("Frame", {Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1}, pDash)
 hlist(pillRow, 6)
@@ -584,10 +671,19 @@ end
 ---------------------------------------------------------------- PAGE: DODGE
 local pDodge = newPage("Dodge")
 BoundToggle(pDodge, "autoDodge", "Auto Dodge", "Aktif saat prompt dodge muncul")
-Slider(pDodge, "Delay reaksi minimum", 10, 200, S.dMin, function(v) return v .. " ms" end, function(v) S.dMin = v end)
-Slider(pDodge, "Delay reaksi maksimum", 10, 250, S.dMax, function(v) return v .. " ms" end, function(v) S.dMax = v end)
-Slider(pDodge, "Peluang dodge", 10, 100, S.dChance, function(v) return v .. "%" end, function(v) S.dChance = v end)
-Note(pDodge, "Jendela dodge default game 0.25 dtk. Delay otomatis dibatasi maksimal 60% dari jendela supaya tidak telat.")
+Header(pDodge, "Mode dodge")
+local humanBox
+Segmented(pDodge, {"Reflex", "Human"}, S.dodgeMode, function(v)
+	S.dodgeMode = v
+	humanBox.Visible = v == "Human"
+end)
+Note(pDodge, "Reflex: dodge ditekan 1 frame setelah prompt muncul, tanpa delay buatan dan tanpa peluang skip. Human: delay dan peluang diacak.")
+humanBox = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Visible = S.dodgeMode == "Human"}, pDodge)
+vlist(humanBox, 8)
+Slider(humanBox, "Delay reaksi minimum", 10, 200, S.dMin, function(v) return v .. " ms" end, function(v) S.dMin = v end)
+Slider(humanBox, "Delay reaksi maksimum", 10, 250, S.dMax, function(v) return v .. " ms" end, function(v) S.dMax = v end)
+Slider(humanBox, "Peluang dodge", 10, 100, S.dChance, function(v) return v .. "%" end, function(v) S.dChance = v end)
+Note(humanBox, "Delay otomatis dibatasi maksimal 60% dari jendela dodge supaya tidak telat.")
 local dodgeInfo = Note(pDodge, "Belum ada prompt dodge.", T.sub)
 
 ---------------------------------------------------------------- PAGE: TRACKER
@@ -640,12 +736,13 @@ for _, a in ipairs(ACCENTS) do
 	corner(b, 17)
 	b.Activated:Connect(function()
 		setAccent(a[2])
+		S.accent = a[1]
 		toast("Aksen: " .. a[1])
 	end)
 end
 Header(pSet, "Umum")
 Toggle(pSet, "Notifikasi", "Toast kecil di atas layar", S.notify, function(v) S.notify = v end)
-Note(pSet, "Buka/tutup UI: RightControl atau tombol bulat S (bisa digeser).")
+Note(pSet, "Buka/tutup UI: RightControl atau tombol bulat S (bisa digeser). Setelan tersimpan otomatis kalau executor mendukung writefile.")
 Button(pSet, "Reset statistik", function()
 	stats.slaps, stats.dodgeOk, stats.dodgeFail, stats.prompts = 0, 0, 0, 0
 	stats.lastPower, stats.lastServer = nil, nil
@@ -658,7 +755,8 @@ refreshStats = function()
 	setSlaps(stats.slaps)
 	setOk(stats.dodgeOk, T.good)
 	setFail(stats.dodgeFail, stats.dodgeFail > 0 and T.bad or T.text)
-	setPow(stats.lastPower and (pct(stats.lastPower) .. "%") or "-")
+	local tot = stats.dodgeOk + stats.dodgeFail
+	setPow(tot > 0 and (math.floor(stats.dodgeOk / tot * 100 + 0.5) .. "%") or "-", tot > 0 and (stats.dodgeFail == 0 and T.good or T.text) or T.sub)
 	if stats.lastPower then
 		slapInfo.Text = ("Terakhir dikirim: %d%%%s"):format(pct(stats.lastPower), stats.lastServer and (" | balasan server: " .. pct(stats.lastServer) .. "%") or "")
 	end
@@ -700,6 +798,7 @@ local function newSweep()
 end
 
 keep(RunService.Heartbeat:Connect(function()
+	if not alive then return end
 	local meter, bar = gameMeter()
 	local vis = meter and bar and meter.Visible
 	if not vis then
@@ -730,7 +829,7 @@ keep(RunService.Heartbeat:Connect(function()
 		if y >= trig then
 			fired = true
 			local v = math.clamp(sweepTarget, 0.01, 0.999)
-			R.SendSlap:FireServer(v)
+			pcall(function() R.SendSlap:FireServer(v) end)
 			stats.slaps = stats.slaps + 1
 			stats.lastPower = v
 			refreshStats()
@@ -747,48 +846,72 @@ keep(R.SlapPercent.OnClientEvent:Connect(function(plr, p, big)
 end))
 
 ---------------------------------------------------------------- LOGIC: AUTO DODGE
-local function pressDodge()
-	local _, _, btn = gameMeter()
-	if btn and btn.Visible and pressBtn(btn, "MouseButton1Down") then return "handler" end
-	R.Dodge:FireServer(true)
-	return "remote"
+do
+	local promptT, token = 0, 0
+
+	-- tekan tombol dodge lewat handler game (kalau sudah tampil); kalau tombol belum muncul
+	-- dalam 2 frame atau window hampir habis -> kirim remote langsung.
+	local function pressDodge(deadline)
+		local frames = 0
+		while alive do
+			local _, _, btn = gameMeter()
+			if btn and btn.Visible and pressBtn(btn, "MouseButton1Down") then return "handler" end
+			frames = frames + 1
+			if frames >= 2 or os.clock() >= deadline then
+				R.Dodge:FireServer(true)
+				return "remote"
+			end
+			RunService.Heartbeat:Wait()
+		end
+	end
+
+	keep(R.DodgePrompt.OnClientEvent:Connect(function(window)
+		window = tonumber(window) or 0.25
+		promptT = os.clock()
+		stats.prompts = stats.prompts + 1
+		local n = stats.prompts
+		pillDodge("Dodge: PROMPT", T.warn)
+		later(math.max(window, 0.4), function() pillDodge("Dodge: standby", T.sub) end)
+		if not S.autoDodge then
+			dodgeInfo.Text = ("Prompt #%d (window %.2fs) | auto dodge OFF"):format(n, window)
+			return
+		end
+		local delay = 0
+		if S.dodgeMode == "Human" then
+			if math.random(100) > S.dChance then
+				addLog("dodge dilewati (peluang)", T.warn)
+				dodgeInfo.Text = ("Prompt #%d | dilewati oleh peluang %d%%"):format(n, S.dChance)
+				return
+			end
+			local lo, hi = math.min(S.dMin, S.dMax), math.max(S.dMin, S.dMax)
+			delay = math.min(math.random(lo, hi) / 1000, window * 0.6)
+		end
+		token = token + 1
+		local mine, t0 = token, promptT
+		task.spawn(function()
+			if delay > 0 then task.wait(delay) else RunService.Heartbeat:Wait() end
+			if not alive or mine ~= token then return end
+			local ok, how = pcall(pressDodge, t0 + window * 0.85)
+			how = ok and how or "error"
+			local ms = math.floor((os.clock() - t0) * 1000 + 0.5)
+			addLog(("dodge via %s (window %.2fs, +%dms)"):format(how, window, ms), ok and T.good or T.bad)
+			dodgeInfo.Text = ("Prompt #%d | window %.2fs | tekan di +%d ms | via %s"):format(n, window, ms, how)
+		end)
+	end))
+
+	keep(R.DodgeResult.OnClientEvent:Connect(function(ok)
+		local ms = math.floor((os.clock() - promptT) * 1000 + 0.5)
+		if ok then
+			stats.dodgeOk = stats.dodgeOk + 1
+			toast(("Dodge berhasil (%d ms)"):format(ms), T.good)
+		else
+			stats.dodgeFail = stats.dodgeFail + 1
+			toast("Dodge gagal", T.bad)
+		end
+		refreshStats()
+		addLog(("hasil dodge: %s | %d ms setelah prompt | ping %d ms"):format(ok and "BERHASIL" or "GAGAL", ms, getPing()), ok and T.good or T.bad)
+	end))
 end
-
-keep(R.DodgePrompt.OnClientEvent:Connect(function(window)
-	window = tonumber(window) or 0.25
-	stats.prompts = stats.prompts + 1
-	pillDodge("Dodge: PROMPT", T.warn)
-	task.delay(math.max(window, 0.4), function() pillDodge("Dodge: standby", T.sub) end)
-	if not S.autoDodge then
-		dodgeInfo.Text = ("Prompt #%d (window %.2fs) | auto dodge OFF"):format(stats.prompts, window)
-		return
-	end
-	if math.random(100) > S.dChance then
-		addLog("dodge dilewati (peluang)", T.warn)
-		dodgeInfo.Text = ("Prompt #%d | dilewati oleh peluang %d%%"):format(stats.prompts, S.dChance)
-		return
-	end
-	local lo, hi = math.min(S.dMin, S.dMax), math.max(S.dMin, S.dMax)
-	local d = math.min(math.random(lo, hi) / 1000, window * 0.6)
-	task.delay(d, function()
-		local how = pressDodge()
-		local ms = math.floor(d * 1000 + 0.5)
-		addLog(("dodge via %s (window %.2fs, delay %dms)"):format(how, window, ms), T.good)
-		dodgeInfo.Text = ("Prompt #%d | window %.2fs | delay %d ms | via %s"):format(stats.prompts, window, ms, how)
-	end)
-end))
-
-keep(R.DodgeResult.OnClientEvent:Connect(function(ok)
-	if ok then
-		stats.dodgeOk = stats.dodgeOk + 1
-		toast("Dodge berhasil", T.good)
-	else
-		stats.dodgeFail = stats.dodgeFail + 1
-		toast("Dodge gagal", T.bad)
-	end
-	refreshStats()
-	addLog("hasil dodge dari server: " .. (ok and "BERHASIL" or "GAGAL"), ok and T.good or T.bad)
-end))
 
 ---------------------------------------------------------------- LOGIC: TRACKER PELAKU SLAP
 local PRETTY = {
@@ -877,27 +1000,42 @@ local function onSlap(plr, rawName)
 	refreshCulprit()
 end
 
-local seenTrack = setmetatable({}, {__mode = "k"})
-task.spawn(function()
-	while alive do
-		task.wait(0.1)
+-- deteksi slap: event AnimationPlayed + polling cepat (cadangan). Track yang sama bisa diputar ulang,
+-- jadi dihitung "baru" lagi kalau sempat berhenti.
+do
+	local active = setmetatable({}, {__mode = "k"})
+	local hooked = setmetatable({}, {__mode = "k"})
+	local stamp = 0
+	local function handleTrack(p, tr)
+		local kind, name = classify(tr)
+		if kind == "slap" then onSlap(p, name) end
+	end
+	local function scan()
+		stamp = stamp + 1
 		for _, p in ipairs(Players:GetPlayers()) do
-			if p ~= LP and p.Character then
-				local hum = p.Character:FindFirstChildOfClass("Humanoid")
-				local an = hum and hum:FindFirstChildOfClass("Animator")
-				if an then
-					for _, tr in ipairs(an:GetPlayingAnimationTracks()) do
-						if not seenTrack[tr] then
-							seenTrack[tr] = true
-							local kind, name = classify(tr)
-							if kind == "slap" then onSlap(p, name) end
-						end
-					end
+			local ch = p ~= LP and p.Character
+			local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+			local an = hum and hum:FindFirstChildOfClass("Animator")
+			if an then
+				if not hooked[an] then
+					hooked[an] = true
+					keep(an.AnimationPlayed:Connect(function(tr) pcall(handleTrack, p, tr) end))
+				end
+				for _, tr in ipairs(an:GetPlayingAnimationTracks()) do
+					local last = active[tr]
+					active[tr] = stamp
+					if not last or last < stamp - 1 then handleTrack(p, tr) end
 				end
 			end
 		end
 	end
-end)
+	task.spawn(function()
+		while alive do
+			task.wait(0.05)
+			pcall(scan)
+		end
+	end)
+end
 
 local function clearMarks()
 	if worldHL then
@@ -971,9 +1109,9 @@ keep(R.Guess.OnClientEvent:Connect(function(list)
 	if culprit then
 		toast("PELAKU: " .. culprit.plr.Name, T.good)
 		addLog(("pelaku: %s (%s)"):format(culprit.plr.Name, culprit.move), T.good)
-		task.delay(0.25, function() if promptActive and culprit then markCulprit(culprit.plr) end end)
+		later(0.25, function() if promptActive and culprit then markCulprit(culprit.plr) end end)
 		if S.autoGuess then
-			task.delay(0.8 + math.random() * 0.9, function() if promptActive then doGuess(false) end end)
+			later(0.8 + math.random() * 0.9, function() if promptActive then doGuess(false) end end)
 		end
 	else
 		toast("Pelaku tidak terdeteksi", T.bad)
@@ -995,14 +1133,54 @@ task.spawn(function()
 end)
 
 ---------------------------------------------------------------- WINDOW CONTROLS
+local winScale = win:FindFirstChildOfClass("UIScale")
+local openTok = 0
+local function setOpen(on)
+	openTok = openTok + 1
+	local mine = openTok
+	if on then
+		win.Visible = true
+		winScale.Scale = 0.92
+		tween(winScale, 0.18, {Scale = 1})
+	else
+		tween(winScale, 0.12, {Scale = 0.92})
+		later(0.13, function() if mine == openTok then win.Visible = false end end)
+	end
+end
+local function toggleWin() setOpen(not win.Visible) end
+
 local fab = mk("TextButton", {Size = UDim2.fromOffset(42, 42), Position = UDim2.new(0, 14, 0.5, -60), Text = "S", TextColor3 = WHITE, Font = FB, TextSize = 18, AutoButtonColor = false}, gui)
 corner(fab, 21)
+do
+	local st = stroke(fab, WHITE, 1)
+	st.Transparency = 0.75
+	mk("UIGradient", {Rotation = 45, Color = ColorSequence.new(WHITE, Color3.fromRGB(185, 185, 185))}, fab)
+end
 onAccent(function() fab.BackgroundColor3 = T.accent end)
-makeDraggable(fab, fab, function() win.Visible = not win.Visible end)
-btnMin.Activated:Connect(function() win.Visible = false end)
+makeDraggable(fab, fab, toggleWin)
+btnMin.Activated:Connect(function() setOpen(false) end)
 keep(UIS.InputBegan:Connect(function(i, gp)
-	if not gp and i.KeyCode == Enum.KeyCode.RightControl then win.Visible = not win.Visible end
+	if not gp and i.KeyCode == Enum.KeyCode.RightControl then toggleWin() end
 end))
+
+-- footer sidebar: ping + fps live
+do
+	local frames, acc, fps = 0, 0, 60
+	keep(RunService.RenderStepped:Connect(function(dt)
+		frames, acc = frames + 1, acc + dt
+		if acc >= 0.5 then
+			fps, frames, acc = math.floor(frames / acc + 0.5), 0, 0
+		end
+	end))
+	task.spawn(function()
+		while alive do
+			local p = getPing()
+			sideStat.Text = ("%dms  %dfps"):format(p, fps)
+			sideStat.TextColor3 = p < 120 and T.good or (p < 220 and T.warn or T.bad)
+			task.wait(0.5)
+		end
+	end)
+end
 
 local function Unload()
 	alive = false
@@ -1020,4 +1198,4 @@ applyMode()
 refreshStats()
 refreshCulprit()
 addLog(("siap | indeks animasi: %d slap, %d dodge"):format(nSlap, nDodge), T.good)
-toast("Slap Assistant aktif", T.good)
+toast("Slap Assistant v3 aktif", T.good)
