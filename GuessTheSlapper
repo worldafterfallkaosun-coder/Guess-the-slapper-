@@ -1,0 +1,1023 @@
+-- Slap Assistant v2 (Delta / Luau)
+-- UI + Auto Slap (power bisa dipilih) + Auto Dodge + Pelacak pelaku slap
+-- Buka/tutup UI: RightControl atau tombol bulat "S". Hapus total: tombol X di window.
+-- Script ini menggantikan AutoSlapDodge.lua, jangan dijalankan bersamaan.
+
+local env = (getgenv and getgenv()) or _G
+if env.__SlapAssistant then pcall(env.__SlapAssistant.Unload) end
+if env.__AutoSlapConns then
+	for _, c in ipairs(env.__AutoSlapConns) do pcall(function() c:Disconnect() end) end
+	env.__AutoSlapConns = nil
+end
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local LP = Players.LocalPlayer
+
+local conns, alive = {}, true
+local function keep(c)
+	conns[#conns + 1] = c
+	return c
+end
+
+local events = RS:WaitForChild("events")
+local R = {}
+for _, n in ipairs({"SendSlap", "Dodge", "DodgePrompt", "DodgeResult", "SlapPercent", "Guess", "Resety"}) do
+	R[n] = events:WaitForChild(n)
+end
+
+---------------------------------------------------------------- STATE
+local S = {
+	autoSlap = true, autoDodge = true, autoGuess = false,
+	worldHL = true, notify = true,
+	mode = "Fixed", power = 100, rmin = 85, rmax = 100, trigger = 90,
+	dMin = 40, dMax = 90, dChance = 100,
+}
+local stats = {slaps = 0, dodgeOk = 0, dodgeFail = 0, prompts = 0}
+
+---------------------------------------------------------------- THEME + HELPERS
+local T = {
+	bg = Color3.fromRGB(13, 15, 21), side = Color3.fromRGB(18, 20, 28),
+	panel = Color3.fromRGB(24, 27, 37), panel2 = Color3.fromRGB(31, 35, 48),
+	off = Color3.fromRGB(58, 64, 82), stroke = Color3.fromRGB(45, 51, 68),
+	text = Color3.fromRGB(236, 239, 246), sub = Color3.fromRGB(138, 147, 170),
+	accent = Color3.fromRGB(99, 102, 241), good = Color3.fromRGB(52, 211, 153),
+	bad = Color3.fromRGB(248, 113, 113), warn = Color3.fromRGB(251, 191, 36),
+}
+local ACCENTS = {
+	{"Indigo", Color3.fromRGB(99, 102, 241)}, {"Cyan", Color3.fromRGB(34, 211, 238)},
+	{"Emerald", Color3.fromRGB(52, 211, 153)}, {"Rose", Color3.fromRGB(244, 63, 94)},
+	{"Amber", Color3.fromRGB(245, 158, 11)},
+}
+local WHITE = Color3.new(1, 1, 1)
+local FB, FM = Enum.Font.GothamBold, Enum.Font.GothamMedium
+
+local accentFns = {}
+local function onAccent(fn)
+	accentFns[#accentFns + 1] = fn
+	fn()
+end
+local function setAccent(c)
+	T.accent = c
+	for _, fn in ipairs(accentFns) do pcall(fn) end
+end
+
+local function mk(class, props, parent)
+	local o = Instance.new(class)
+	if props then
+		for k, v in pairs(props) do o[k] = v end
+	end
+	if parent then o.Parent = parent end
+	return o
+end
+local function tween(o, t, props)
+	local tw = TweenService:Create(o, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props)
+	tw:Play()
+	return tw
+end
+local function corner(o, r) return mk("UICorner", {CornerRadius = UDim.new(0, r or 8)}, o) end
+local function stroke(o, col, th) return mk("UIStroke", {Color = col, Thickness = th or 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, o) end
+local function pad(o, l, t, r, b)
+	return mk("UIPadding", {PaddingLeft = UDim.new(0, l), PaddingTop = UDim.new(0, t), PaddingRight = UDim.new(0, r or l), PaddingBottom = UDim.new(0, b or t)}, o)
+end
+local function vlist(o, gap)
+	return mk("UIListLayout", {Padding = UDim.new(0, gap or 6), SortOrder = Enum.SortOrder.LayoutOrder}, o)
+end
+local function hlist(o, gap)
+	return mk("UIListLayout", {Padding = UDim.new(0, gap or 6), SortOrder = Enum.SortOrder.LayoutOrder, FillDirection = Enum.FillDirection.Horizontal}, o)
+end
+local function label(parent, text, size, color, font, xalign)
+	return mk("TextLabel", {
+		BackgroundTransparency = 1, Text = text, TextSize = size or 13, TextColor3 = color or T.text,
+		Font = font or FM, TextXAlignment = xalign or Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+	}, parent)
+end
+local function ts() return os.date("%H:%M:%S") end
+local function pct(v) return math.floor(v * 100 + 0.5) end
+
+---------------------------------------------------------------- GAME ACCESS
+local function gameGui()
+	local pg = LP:FindFirstChild("PlayerGui")
+	return pg and pg:FindFirstChild("ScreenGui")
+end
+local function gameMeter()
+	local g = gameGui()
+	local m = g and g:FindFirstChild("meter")
+	local c = m and m:FindFirstChild("color")
+	return m, c and c:FindFirstChild("bar"), g and g:FindFirstChild("dodgebut")
+end
+-- tekan tombol lewat handler game sendiri
+local function pressBtn(btn, sig)
+	if getconnections then
+		local ok, n = pcall(function()
+			local list = getconnections(btn[sig])
+			for _, c in ipairs(list) do c:Fire() end
+			return #list
+		end)
+		if ok and n > 0 then return true end
+	end
+	if firesignal and pcall(firesignal, btn[sig]) then return true end
+	return false
+end
+
+---------------------------------------------------------------- ROOT GUI
+local gui = mk("ScreenGui", {Name = "SlapAssistantUI", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, IgnoreGuiInset = true, DisplayOrder = 1000})
+local function mount(g)
+	local targets = {}
+	if gethui then targets[#targets + 1] = function() return gethui() end end
+	targets[#targets + 1] = function() return game:GetService("CoreGui") end
+	targets[#targets + 1] = function() return LP:WaitForChild("PlayerGui") end
+	for _, f in ipairs(targets) do
+		local ok, parent = pcall(f)
+		if ok and parent then
+			local ok2 = pcall(function() g.Parent = parent end)
+			if ok2 and g.Parent == parent then return parent end
+		end
+	end
+end
+local holder = mount(gui)
+
+local cam = workspace.CurrentCamera
+local vp = cam and cam.ViewportSize or Vector2.new(800, 450)
+local W = math.clamp(vp.X - 24, 300, 540)
+local H = math.clamp(vp.Y - 24, 240, 340)
+local SW = W < 420 and 88 or 112
+
+local win = mk("Frame", {Name = "Window", Size = UDim2.fromOffset(W, H), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), BackgroundColor3 = T.bg, ClipsDescendants = true}, gui)
+corner(win, 12)
+stroke(win, T.stroke, 1)
+
+local function makeDraggable(handle, target, onTap)
+	local dragging, dragInput, dragStart, startPos, moved = false, nil, nil, nil, false
+	handle.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragInput, moved = true, i, false
+			dragStart, startPos = i.Position, target.Position
+			i.Changed:Connect(function()
+				if i.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					if onTap and not moved then onTap() end
+				end
+			end)
+		end
+	end)
+	keep(UIS.InputChanged:Connect(function(i)
+		if dragging and (i == dragInput or i.UserInputType == Enum.UserInputType.MouseMovement) then
+			local d = i.Position - dragStart
+			if d.Magnitude > 5 then moved = true end
+			target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end))
+end
+
+-- top bar
+local top = mk("Frame", {Size = UDim2.new(1, 0, 0, 40), BackgroundColor3 = T.side}, win)
+local dot = mk("Frame", {Size = UDim2.fromOffset(10, 10), Position = UDim2.fromOffset(14, 15)}, top)
+corner(dot, 5)
+onAccent(function() dot.BackgroundColor3 = T.accent end)
+local ttl = label(top, "SLAP ASSISTANT", 14, T.text, FB)
+ttl.Position, ttl.Size = UDim2.fromOffset(32, 0), UDim2.new(0, 120, 1, 0)
+local ver = label(top, "v2.0", 11, T.sub)
+ver.Position, ver.Size = UDim2.fromOffset(150, 0), UDim2.new(0, 40, 1, 0)
+local dragZone = mk("Frame", {Size = UDim2.new(1, -80, 1, 0), BackgroundTransparency = 1, ZIndex = 5}, top)
+makeDraggable(dragZone, win)
+
+local function topBtn(txt, xoff, col)
+	local b = mk("TextButton", {Size = UDim2.fromOffset(28, 28), Position = UDim2.new(1, xoff, 0.5, -14), BackgroundColor3 = T.panel2, Text = txt, TextColor3 = col or T.text, Font = FB, TextSize = 15, AutoButtonColor = true}, top)
+	corner(b, 7)
+	return b
+end
+local btnClose = topBtn("X", -36, T.bad)
+local btnMin = topBtn("-", -70)
+
+local side = mk("Frame", {Position = UDim2.fromOffset(0, 40), Size = UDim2.new(0, SW, 1, -40), BackgroundColor3 = T.side}, win)
+local tabHolder = mk("Frame", {Size = UDim2.new(1, 0, 1, -30), BackgroundTransparency = 1}, side)
+pad(tabHolder, 8, 8)
+vlist(tabHolder, 4)
+local sideStat = label(side, "ON  |  Delta", 10, T.good, FB)
+sideStat.Position, sideStat.Size = UDim2.new(0, 14, 1, -24), UDim2.new(1, -14, 0, 16)
+
+local content = mk("Frame", {Position = UDim2.fromOffset(SW, 40), Size = UDim2.new(1, -SW, 1, -40), BackgroundTransparency = 1}, win)
+
+---------------------------------------------------------------- PAGES + TABS
+local pages, tabBtns = {}, {}
+local function newPage(name)
+	local p = mk("ScrollingFrame", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+		ScrollBarImageColor3 = T.off, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Visible = false,
+	}, content)
+	pad(p, 10, 10, 12, 10)
+	vlist(p, 8)
+	pages[name] = p
+	return p
+end
+local function showTab(name)
+	for n, p in pairs(pages) do p.Visible = (n == name) end
+	for n, t in pairs(tabBtns) do t.paint(n == name) end
+end
+for i, name in ipairs({"Dashboard", "Slap", "Dodge", "Tracker", "Log", "Setelan"}) do
+	local b = mk("TextButton", {Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = T.panel2, BackgroundTransparency = 1, Text = "", AutoButtonColor = false, LayoutOrder = i}, tabHolder)
+	corner(b, 8)
+	local bar = mk("Frame", {Size = UDim2.fromOffset(3, 16), Position = UDim2.new(0, 0, 0.5, -8), Visible = false}, b)
+	corner(bar, 2)
+	local l = label(b, name, 13, T.sub, FB)
+	l.Position, l.Size = UDim2.fromOffset(14, 0), UDim2.new(1, -14, 1, 0)
+	local active = false
+	tabBtns[name] = {paint = function(on)
+		active = on
+		b.BackgroundTransparency = on and 0 or 1
+		l.TextColor3 = on and T.text or T.sub
+		bar.Visible = on
+		bar.BackgroundColor3 = T.accent
+	end}
+	onAccent(function() tabBtns[name].paint(active) end)
+	b.Activated:Connect(function() showTab(name) end)
+end
+
+---------------------------------------------------------------- COMPONENTS
+local function Header(parent, text)
+	local l = label(parent, string.upper(text), 11, T.sub, FB)
+	l.Size = UDim2.new(1, 0, 0, 16)
+	return l
+end
+local function Note(parent, text, col)
+	local l = label(parent, text, 11, col or T.sub)
+	l.Size = UDim2.new(1, 0, 0, 0)
+	l.AutomaticSize = Enum.AutomaticSize.Y
+	l.TextWrapped = true
+	l.TextTruncate = Enum.TextTruncate.None
+	l.TextYAlignment = Enum.TextYAlignment.Top
+	return l
+end
+local function Toggle(parent, title, desc, default, cb)
+	local row = mk("TextButton", {Size = UDim2.new(1, 0, 0, desc and 46 or 36), BackgroundColor3 = T.panel2, AutoButtonColor = false, Text = ""}, parent)
+	corner(row, 8)
+	local t = label(row, title, 13, T.text, FB)
+	t.Position, t.Size = UDim2.fromOffset(12, desc and 7 or 0), UDim2.new(1, -70, 0, desc and 16 or 36)
+	if desc then
+		local d = label(row, desc, 11, T.sub)
+		d.Position, d.Size = UDim2.fromOffset(12, 24), UDim2.new(1, -70, 0, 14)
+	end
+	local sw = mk("Frame", {Size = UDim2.fromOffset(38, 20), AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), BackgroundColor3 = T.off}, row)
+	corner(sw, 10)
+	local knob = mk("Frame", {Size = UDim2.fromOffset(14, 14), Position = UDim2.fromOffset(3, 3), BackgroundColor3 = WHITE}, sw)
+	corner(knob, 7)
+	local obj = {Value = default and true or false}
+	local function paint(animate)
+		local col = obj.Value and T.accent or T.off
+		local pos = obj.Value and UDim2.fromOffset(21, 3) or UDim2.fromOffset(3, 3)
+		if animate then
+			tween(sw, 0.15, {BackgroundColor3 = col})
+			tween(knob, 0.15, {Position = pos})
+		else
+			sw.BackgroundColor3, knob.Position = col, pos
+		end
+	end
+	function obj.Set(v, silent)
+		obj.Value = v and true or false
+		paint(true)
+		if not silent and cb then cb(obj.Value) end
+	end
+	row.Activated:Connect(function() obj.Set(not obj.Value) end)
+	onAccent(function() paint(false) end)
+	return obj
+end
+local bound = {}
+local function BoundToggle(parent, key, title, desc, after)
+	local obj = Toggle(parent, title, desc, S[key], function(v)
+		S[key] = v
+		for _, o in ipairs(bound[key]) do
+			if o.Value ~= v then o.Set(v, true) end
+		end
+		if after then after(v) end
+	end)
+	bound[key] = bound[key] or {}
+	table.insert(bound[key], obj)
+	return obj
+end
+local function Slider(parent, title, min, max, default, fmt, cb)
+	fmt = fmt or tostring
+	local box = mk("Frame", {Size = UDim2.new(1, 0, 0, 50), BackgroundColor3 = T.panel2}, parent)
+	corner(box, 8)
+	local t = label(box, title, 12, T.sub)
+	t.Position, t.Size = UDim2.fromOffset(12, 7), UDim2.new(0.65, -12, 0, 16)
+	local v = label(box, "", 12, T.text, FB, Enum.TextXAlignment.Right)
+	v.Position, v.Size = UDim2.new(0.65, 0, 0, 7), UDim2.new(0.35, -12, 0, 16)
+	local track = mk("Frame", {Size = UDim2.new(1, -28, 0, 6), Position = UDim2.fromOffset(14, 34), BackgroundColor3 = T.off}, box)
+	corner(track, 3)
+	local fill = mk("Frame", {Size = UDim2.fromScale(0, 1)}, track)
+	corner(fill, 3)
+	local knob = mk("Frame", {Size = UDim2.fromOffset(16, 16), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0, 0.5), BackgroundColor3 = WHITE, ZIndex = 2}, track)
+	corner(knob, 8)
+	local hit = mk("TextButton", {Size = UDim2.new(1, 0, 0, 30), Position = UDim2.fromOffset(0, 20), BackgroundTransparency = 1, Text = ""}, box)
+	local obj = {Value = default}
+	onAccent(function() fill.BackgroundColor3 = T.accent end)
+	local function render()
+		local a = (obj.Value - min) / (max - min)
+		fill.Size = UDim2.fromScale(a, 1)
+		knob.Position = UDim2.fromScale(a, 0.5)
+		v.Text = fmt(obj.Value)
+	end
+	function obj.Set(x, silent)
+		x = math.floor(math.clamp(x, min, max) + 0.5)
+		local old = obj.Value
+		obj.Value = x
+		render()
+		if not silent and cb and x ~= old then cb(x) end
+	end
+	local dragging, dragInput = false, nil
+	local function fromInput(i)
+		local a = math.clamp((i.Position.X - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+		obj.Set(min + a * (max - min))
+	end
+	local function lockScroll(lock)
+		local sf = box:FindFirstAncestorOfClass("ScrollingFrame")
+		if sf then sf.ScrollingEnabled = not lock end
+	end
+	hit.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragInput = true, i
+			lockScroll(true)
+			fromInput(i)
+		end
+	end)
+	keep(UIS.InputChanged:Connect(function(i)
+		if dragging and (i == dragInput or i.UserInputType == Enum.UserInputType.MouseMovement) then fromInput(i) end
+	end))
+	keep(UIS.InputEnded:Connect(function(i)
+		if dragging and (i == dragInput or i.UserInputType == Enum.UserInputType.MouseButton1) then
+			dragging = false
+			lockScroll(false)
+		end
+	end))
+	obj.Set(default, true)
+	return obj
+end
+local function Segmented(parent, options, default, cb)
+	local box = mk("Frame", {Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = T.panel2}, parent)
+	corner(box, 8)
+	pad(box, 3, 3)
+	hlist(box, 4)
+	local obj, btns, n = {Value = default}, {}, #options
+	local function paint()
+		for name, b in pairs(btns) do
+			local on = name == obj.Value
+			b.BackgroundTransparency = on and 0 or 1
+			b.BackgroundColor3 = T.accent
+			b.TextColor3 = on and WHITE or T.sub
+		end
+	end
+	for i, name in ipairs(options) do
+		local b = mk("TextButton", {Size = UDim2.new(1 / n, -4 * (n - 1) / n, 1, 0), Text = name, Font = FB, TextSize = 12, AutoButtonColor = false, LayoutOrder = i}, box)
+		corner(b, 6)
+		btns[name] = b
+		b.Activated:Connect(function()
+			obj.Value = name
+			paint()
+			cb(name)
+		end)
+	end
+	onAccent(paint)
+	return obj
+end
+local function Chips(parent, values, onPick)
+	local row = mk("Frame", {Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1}, parent)
+	hlist(row, 6)
+	local btns, cur, n = {}, nil, #values
+	local function refresh(c)
+		cur = c
+		for v, b in pairs(btns) do
+			local on = v == cur
+			b.BackgroundColor3 = on and T.accent or T.panel2
+			b.TextColor3 = on and WHITE or T.text
+		end
+	end
+	for i, v in ipairs(values) do
+		local b = mk("TextButton", {Size = UDim2.new(1 / n, -6 * (n - 1) / n, 1, 0), BackgroundColor3 = T.panel2, Text = v .. "%", TextColor3 = T.text, Font = FB, TextSize = 12, AutoButtonColor = false, LayoutOrder = i}, row)
+		corner(b, 7)
+		b.Activated:Connect(function() onPick(v) end)
+		btns[v] = b
+	end
+	onAccent(function() refresh(cur) end)
+	return {Refresh = refresh}
+end
+local function Button(parent, text, cb, danger)
+	local b = mk("TextButton", {Size = UDim2.new(1, 0, 0, 34), Text = text, TextColor3 = WHITE, Font = FB, TextSize = 13, AutoButtonColor = true, BackgroundColor3 = T.accent}, parent)
+	corner(b, 8)
+	if danger then b.BackgroundColor3 = T.bad else onAccent(function() b.BackgroundColor3 = T.accent end) end
+	b.Activated:Connect(function() cb() end)
+	return b
+end
+local function StatCard(parent, title, order)
+	local c = mk("Frame", {BackgroundColor3 = T.panel2, LayoutOrder = order}, parent)
+	corner(c, 8)
+	local l = label(c, title, 11, T.sub)
+	l.Position, l.Size = UDim2.fromOffset(10, 8), UDim2.new(1, -20, 0, 14)
+	local v = label(c, "0", 20, T.text, FB)
+	v.Position, v.Size = UDim2.fromOffset(10, 25), UDim2.new(1, -20, 0, 26)
+	return function(text, col)
+		v.Text = tostring(text)
+		v.TextColor3 = col or T.text
+	end
+end
+local function Pill(parent, text)
+	local f = mk("Frame", {Size = UDim2.fromOffset(0, 24), AutomaticSize = Enum.AutomaticSize.X, BackgroundColor3 = T.panel2}, parent)
+	corner(f, 12)
+	pad(f, 10, 0)
+	local l = label(f, text, 11, T.sub, FB)
+	l.Size, l.AutomaticSize = UDim2.new(0, 0, 1, 0), Enum.AutomaticSize.X
+	return function(txt, col)
+		l.Text = txt
+		l.TextColor3 = col or T.sub
+	end
+end
+local meters = {}
+local function MeterWidget(parent)
+	local box = mk("Frame", {Size = UDim2.new(1, 0, 0, 62), BackgroundColor3 = T.panel2}, parent)
+	corner(box, 8)
+	local t = label(box, "Live Meter", 12, T.sub)
+	t.Position, t.Size = UDim2.fromOffset(12, 7), UDim2.new(0.4, 0, 0, 16)
+	local st = label(box, "IDLE", 11, T.sub, FB, Enum.TextXAlignment.Right)
+	st.Position, st.Size = UDim2.new(0.4, 0, 0, 7), UDim2.new(0.6, -12, 0, 16)
+	local track = mk("Frame", {Size = UDim2.new(1, -24, 0, 12), Position = UDim2.fromOffset(12, 38), BackgroundColor3 = T.off}, box)
+	corner(track, 6)
+	local band = mk("Frame", {Size = UDim2.fromScale(0, 1), BackgroundTransparency = 0.55, Visible = false, ZIndex = 1}, track)
+	mk("Frame", {Size = UDim2.fromScale(0.03, 1), Position = UDim2.fromScale(0.97, 0), BackgroundColor3 = T.warn, ZIndex = 2}, track)
+	local fill = mk("Frame", {Size = UDim2.fromScale(0, 1), ZIndex = 3, BackgroundTransparency = 0.15}, track)
+	corner(fill, 6)
+	local mark = mk("Frame", {Size = UDim2.new(0, 2, 1, 10), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(1, 0.5), BackgroundColor3 = WHITE, ZIndex = 4}, track)
+	onAccent(function()
+		fill.BackgroundColor3 = T.accent
+		band.BackgroundColor3 = T.accent
+	end)
+	local w = {}
+	function w.Bar(y) fill.Size = UDim2.fromScale(y, 1) end
+	function w.Target(p) mark.Position = UDim2.fromScale(p, 0.5) end
+	function w.Band(lo, hi)
+		if lo then
+			band.Visible = true
+			band.Position, band.Size = UDim2.fromScale(lo, 0), UDim2.fromScale(hi - lo, 1)
+		else
+			band.Visible = false
+		end
+	end
+	function w.Status(text, col)
+		st.Text = text
+		st.TextColor3 = col or T.sub
+	end
+	meters[#meters + 1] = w
+	return w
+end
+
+---------------------------------------------------------------- TOAST + LOG
+local toastHost = mk("Frame", {Size = UDim2.fromOffset(320, 0), AutomaticSize = Enum.AutomaticSize.Y, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 10), BackgroundTransparency = 1, ZIndex = 50}, gui)
+mk("UIListLayout", {Padding = UDim.new(0, 6), HorizontalAlignment = Enum.HorizontalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder}, toastHost)
+local function toast(text, col)
+	if not S.notify then return end
+	local f = mk("CanvasGroup", {Size = UDim2.fromOffset(0, 30), AutomaticSize = Enum.AutomaticSize.X, BackgroundColor3 = T.panel, GroupTransparency = 1}, toastHost)
+	corner(f, 8)
+	stroke(f, col or T.accent, 1)
+	pad(f, 12, 0)
+	local l = label(f, text, 12, T.text, FM)
+	l.Size, l.AutomaticSize, l.TextTruncate = UDim2.new(0, 0, 1, 0), Enum.AutomaticSize.X, Enum.TextTruncate.None
+	tween(f, 0.2, {GroupTransparency = 0})
+	task.delay(2.8, function()
+		if f.Parent then
+			tween(f, 0.25, {GroupTransparency = 1})
+			task.wait(0.3)
+			f:Destroy()
+		end
+	end)
+end
+
+local logLines, logHost, logN = {}, nil, 0
+local function addLog(text, col)
+	local line = ("[%s] %s"):format(ts(), text)
+	logLines[#logLines + 1] = line
+	if #logLines > 300 then table.remove(logLines, 1) end
+	if logHost then
+		logN = logN + 1
+		local l = label(logHost, line, 11, col or T.sub, Enum.Font.Code)
+		l.Size, l.AutomaticSize, l.TextWrapped = UDim2.new(1, 0, 0, 0), Enum.AutomaticSize.Y, true
+		l.TextTruncate, l.LayoutOrder = Enum.TextTruncate.None, logN
+		local kids = logHost:GetChildren()
+		if #kids > 160 then
+			for _, k in ipairs(kids) do
+				if k:IsA("TextLabel") then
+					k:Destroy()
+					break
+				end
+			end
+		end
+	end
+end
+
+---------------------------------------------------------------- PAGE: DASHBOARD
+local refreshStats, refreshMarkers
+local pDash = newPage("Dashboard")
+local grid = mk("Frame", {Size = UDim2.new(1, 0, 0, 58), BackgroundTransparency = 1}, pDash)
+mk("UIGridLayout", {CellSize = UDim2.new(0.25, -6, 1, 0), CellPadding = UDim2.fromOffset(8, 0), SortOrder = Enum.SortOrder.LayoutOrder}, grid)
+local setSlaps = StatCard(grid, "Slap terkirim", 1)
+local setOk = StatCard(grid, "Dodge sukses", 2)
+local setFail = StatCard(grid, "Dodge gagal", 3)
+local setPow = StatCard(grid, "Power akhir", 4)
+MeterWidget(pDash)
+local pillRow = mk("Frame", {Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1}, pDash)
+hlist(pillRow, 6)
+local pillMeter = Pill(pillRow, "Meter: idle")
+local pillDodge = Pill(pillRow, "Dodge: standby")
+local pillTrack = Pill(pillRow, "Pelacak: 0 slap")
+Header(pDash, "Kontrol utama")
+BoundToggle(pDash, "autoSlap", "Auto Slap", "Kirim slap otomatis saat meter jalan")
+BoundToggle(pDash, "autoDodge", "Auto Dodge", "Tekan tombol dodge saat prompt muncul")
+
+---------------------------------------------------------------- PAGE: SLAP
+local applyMode
+local pSlap = newPage("Slap")
+Header(pSlap, "Mode power")
+Segmented(pSlap, {"Fixed", "Random", "Perfect"}, S.mode, function(v)
+	S.mode = v
+	applyMode()
+end)
+local fixedBox = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1}, pSlap)
+vlist(fixedBox, 8)
+local randBox = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Visible = false}, pSlap)
+vlist(randBox, 8)
+local perfBox = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Visible = false}, pSlap)
+vlist(perfBox, 8)
+
+local perfNote
+local chips
+local powerSlider = Slider(fixedBox, "Power slap", 1, 100, S.power, function(v) return v .. "%" end, function(v)
+	S.power = v
+	chips.Refresh(v)
+	perfNote.Text = v >= 97 and "Power ini masuk zona PERFECT (>= 97%)." or "Di bawah 97% bukan perfect."
+	perfNote.TextColor3 = v >= 97 and T.good or T.sub
+	refreshMarkers()
+end)
+chips = Chips(fixedBox, {25, 50, 75, 90, 100}, function(v) powerSlider.Set(v) end)
+perfNote = Note(fixedBox, "")
+chips.Refresh(S.power)
+perfNote.Text = "Power ini masuk zona PERFECT (>= 97%)."
+perfNote.TextColor3 = T.good
+
+Slider(randBox, "Power minimum", 1, 100, S.rmin, function(v) return v .. "%" end, function(v) S.rmin = v refreshMarkers() end)
+Slider(randBox, "Power maksimum", 1, 100, S.rmax, function(v) return v .. "%" end, function(v) S.rmax = v refreshMarkers() end)
+Note(randBox, "Tiap sapuan meter, power diacak di antara min dan max.")
+Note(perfBox, "Selalu kirim 98-100% (zona perfect). Nilainya diacak tipis supaya tidak identik.", T.sub)
+
+MeterWidget(pSlap)
+Slider(pSlap, "Batas trigger (%)", 60, 97, S.trigger, function(v) return v .. "%" end, function(v) S.trigger = v end)
+Note(pSlap, "Untuk power tinggi, slap dikirim saat bar mencapai batas ini. Jendela perfect game cuma sekitar 16 ms di ujung sapuan (0.8 dtk), jadi batas dibuat sedikit lebih awal supaya tidak lolos frame.")
+local slapInfo = Note(pSlap, "Belum ada slap terkirim.", T.sub)
+
+applyMode = function()
+	fixedBox.Visible = S.mode == "Fixed"
+	randBox.Visible = S.mode == "Random"
+	perfBox.Visible = S.mode == "Perfect"
+	refreshMarkers()
+end
+
+---------------------------------------------------------------- PAGE: DODGE
+local pDodge = newPage("Dodge")
+BoundToggle(pDodge, "autoDodge", "Auto Dodge", "Aktif saat prompt dodge muncul")
+Slider(pDodge, "Delay reaksi minimum", 10, 200, S.dMin, function(v) return v .. " ms" end, function(v) S.dMin = v end)
+Slider(pDodge, "Delay reaksi maksimum", 10, 250, S.dMax, function(v) return v .. " ms" end, function(v) S.dMax = v end)
+Slider(pDodge, "Peluang dodge", 10, 100, S.dChance, function(v) return v .. "%" end, function(v) S.dChance = v end)
+Note(pDodge, "Jendela dodge default game 0.25 dtk. Delay otomatis dibatasi maksimal 60% dari jendela supaya tidak telat.")
+local dodgeInfo = Note(pDodge, "Belum ada prompt dodge.", T.sub)
+
+---------------------------------------------------------------- PAGE: TRACKER
+local pTrk = newPage("Tracker")
+local card = mk("Frame", {Size = UDim2.new(1, 0, 0, 84), BackgroundColor3 = T.panel2}, pTrk)
+corner(card, 10)
+local av = mk("ImageLabel", {Size = UDim2.fromOffset(60, 60), Position = UDim2.fromOffset(12, 12), BackgroundColor3 = T.off, Image = ""}, card)
+corner(av, 30)
+local cName = label(card, "Belum ada", 16, T.text, FB)
+cName.Position, cName.Size = UDim2.fromOffset(84, 12), UDim2.new(1, -96, 0, 22)
+local cInfo = label(card, "Menunggu slap...", 12, T.sub)
+cInfo.Position, cInfo.Size = UDim2.fromOffset(84, 36), UDim2.new(1, -96, 0, 16)
+local cState = label(card, "STANDBY", 11, T.warn, FB)
+cState.Position, cState.Size = UDim2.fromOffset(84, 56), UDim2.new(1, -96, 0, 16)
+
+local doGuess
+Button(pTrk, "Tebak pelaku sekarang", function() doGuess(true) end)
+BoundToggle(pTrk, "autoGuess", "Auto Tebak", "Pilih pelaku otomatis saat layar suspects muncul")
+BoundToggle(pTrk, "worldHL", "Sorot pelaku di dunia", "Highlight karakter pelaku", function() end)
+Header(pTrk, "Riwayat slap")
+local histBox = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1}, pTrk)
+vlist(histBox, 6)
+
+---------------------------------------------------------------- PAGE: LOG
+local pLog = newPage("Log")
+Button(pLog, "Salin log ke clipboard", function()
+	if setclipboard then
+		setclipboard(table.concat(logLines, "\n"))
+		toast("Log disalin", T.good)
+	else
+		toast("setclipboard tidak tersedia", T.bad)
+	end
+end)
+Button(pLog, "Bersihkan log", function()
+	logLines = {}
+	for _, k in ipairs(logHost:GetChildren()) do
+		if k:IsA("TextLabel") then k:Destroy() end
+	end
+end)
+logHost = mk("Frame", {Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1}, pLog)
+vlist(logHost, 2)
+
+---------------------------------------------------------------- PAGE: SETELAN
+local pSet = newPage("Setelan")
+Header(pSet, "Warna aksen")
+local swRow = mk("Frame", {Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1}, pSet)
+hlist(swRow, 8)
+for _, a in ipairs(ACCENTS) do
+	local b = mk("TextButton", {Size = UDim2.fromOffset(34, 34), BackgroundColor3 = a[2], Text = "", AutoButtonColor = false}, swRow)
+	corner(b, 17)
+	b.Activated:Connect(function()
+		setAccent(a[2])
+		toast("Aksen: " .. a[1])
+	end)
+end
+Header(pSet, "Umum")
+Toggle(pSet, "Notifikasi", "Toast kecil di atas layar", S.notify, function(v) S.notify = v end)
+Note(pSet, "Buka/tutup UI: RightControl atau tombol bulat S (bisa digeser).")
+Button(pSet, "Reset statistik", function()
+	stats.slaps, stats.dodgeOk, stats.dodgeFail, stats.prompts = 0, 0, 0, 0
+	stats.lastPower, stats.lastServer = nil, nil
+	refreshStats()
+	toast("Statistik direset")
+end)
+
+---------------------------------------------------------------- STATS / MARKERS
+refreshStats = function()
+	setSlaps(stats.slaps)
+	setOk(stats.dodgeOk, T.good)
+	setFail(stats.dodgeFail, stats.dodgeFail > 0 and T.bad or T.text)
+	setPow(stats.lastPower and (pct(stats.lastPower) .. "%") or "-")
+	if stats.lastPower then
+		slapInfo.Text = ("Terakhir dikirim: %d%%%s"):format(pct(stats.lastPower), stats.lastServer and (" | balasan server: " .. pct(stats.lastServer) .. "%") or "")
+	end
+end
+refreshMarkers = function()
+	local lo, hi, tp
+	if S.mode == "Fixed" then
+		tp = S.power / 100
+	elseif S.mode == "Random" then
+		lo, hi = math.min(S.rmin, S.rmax) / 100, math.max(S.rmin, S.rmax) / 100
+		tp = hi
+	else
+		lo, hi, tp = 0.98, 1, 0.99
+	end
+	for _, w in ipairs(meters) do
+		w.Target(tp)
+		w.Band(lo, hi)
+	end
+end
+
+---------------------------------------------------------------- LOGIC: AUTO SLAP
+local function choosePower()
+	if S.mode == "Perfect" then return math.random(98, 100) / 100 end
+	if S.mode == "Random" then
+		local lo, hi = math.min(S.rmin, S.rmax), math.max(S.rmin, S.rmax)
+		return math.random(lo, hi) / 100
+	end
+	return S.power / 100
+end
+
+local meterActive, fired, sweepTarget, lastY = false, false, nil, 0
+local function newSweep()
+	fired = false
+	sweepTarget = choosePower()
+	for _, w in ipairs(meters) do
+		w.Target(sweepTarget)
+		w.Status(("AKTIF | target %d%%"):format(pct(sweepTarget)), T.good)
+	end
+end
+
+keep(RunService.Heartbeat:Connect(function()
+	local meter, bar = gameMeter()
+	local vis = meter and bar and meter.Visible
+	if not vis then
+		if meterActive then
+			meterActive = false
+			for _, w in ipairs(meters) do
+				w.Status("IDLE", T.sub)
+				w.Bar(0)
+			end
+			refreshMarkers()
+			pillMeter("Meter: idle", T.sub)
+		end
+		return
+	end
+	local y = bar.Position.Y.Scale
+	if not meterActive then
+		meterActive, lastY = true, y
+		newSweep()
+		pillMeter("Meter: AKTIF", T.good)
+		addLog("meter mulai", T.sub)
+	elseif y < lastY - 0.3 then
+		newSweep()
+	end
+	lastY = y
+	for _, w in ipairs(meters) do w.Bar(y) end
+	if S.autoSlap and not fired and sweepTarget then
+		local trig = math.min(sweepTarget, S.trigger / 100)
+		if y >= trig then
+			fired = true
+			local v = math.clamp(sweepTarget, 0.01, 0.999)
+			R.SendSlap:FireServer(v)
+			stats.slaps = stats.slaps + 1
+			stats.lastPower = v
+			refreshStats()
+			addLog(("slap dikirim %d%% (bar %.2f)"):format(pct(v), y), T.good)
+		end
+	end
+end))
+
+keep(R.SlapPercent.OnClientEvent:Connect(function(plr, p, big)
+	p = tonumber(p) or 0
+	stats.lastServer = p
+	refreshStats()
+	addLog(("SlapPercent: %s %d%% big=%s"):format(tostring(plr), pct(p), tostring(big)), T.sub)
+end))
+
+---------------------------------------------------------------- LOGIC: AUTO DODGE
+local function pressDodge()
+	local _, _, btn = gameMeter()
+	if btn and btn.Visible and pressBtn(btn, "MouseButton1Down") then return "handler" end
+	R.Dodge:FireServer(true)
+	return "remote"
+end
+
+keep(R.DodgePrompt.OnClientEvent:Connect(function(window)
+	window = tonumber(window) or 0.25
+	stats.prompts = stats.prompts + 1
+	pillDodge("Dodge: PROMPT", T.warn)
+	task.delay(math.max(window, 0.4), function() pillDodge("Dodge: standby", T.sub) end)
+	if not S.autoDodge then
+		dodgeInfo.Text = ("Prompt #%d (window %.2fs) | auto dodge OFF"):format(stats.prompts, window)
+		return
+	end
+	if math.random(100) > S.dChance then
+		addLog("dodge dilewati (peluang)", T.warn)
+		dodgeInfo.Text = ("Prompt #%d | dilewati oleh peluang %d%%"):format(stats.prompts, S.dChance)
+		return
+	end
+	local lo, hi = math.min(S.dMin, S.dMax), math.max(S.dMin, S.dMax)
+	local d = math.min(math.random(lo, hi) / 1000, window * 0.6)
+	task.delay(d, function()
+		local how = pressDodge()
+		local ms = math.floor(d * 1000 + 0.5)
+		addLog(("dodge via %s (window %.2fs, delay %dms)"):format(how, window, ms), T.good)
+		dodgeInfo.Text = ("Prompt #%d | window %.2fs | delay %d ms | via %s"):format(stats.prompts, window, ms, how)
+	end)
+end))
+
+keep(R.DodgeResult.OnClientEvent:Connect(function(ok)
+	if ok then
+		stats.dodgeOk = stats.dodgeOk + 1
+		toast("Dodge berhasil", T.good)
+	else
+		stats.dodgeFail = stats.dodgeFail + 1
+		toast("Dodge gagal", T.bad)
+	end
+	refreshStats()
+	addLog("hasil dodge dari server: " .. (ok and "BERHASIL" or "GAGAL"), ok and T.good or T.bad)
+end))
+
+---------------------------------------------------------------- LOGIC: TRACKER PELAKU SLAP
+local PRETTY = {
+	hardslapper = "Slap Default", spike = "Spike", bikeslapper = "Bicycle Kick", backhandslapper = "Backhand",
+	backflipslapper = "Backflip", backkick = "Backkick", uppercut = "Uppercut", barrage = "Barrage",
+	airstrike = "Airstrike", dropkick = "Drop Kick", tableflip = "Table Flip", rko = "RKO",
+	dempseyroll = "Dempsey Roll", katana = "Katana", reversalred = "Reversal Red", delete = "Delete",
+}
+local SLAP_WORDS = {"slapper", "uppercut", "barrage", "airstrike", "spike", "backkick", "dropkick", "tableflip", "rko", "dempsey", "katana", "reversal", "delete"}
+local animMap, nSlap, nDodge = {}, 0, 0
+local function idOf(s) return tonumber(tostring(s):match("%d+")) end
+local function indexFolder(folder, kind)
+	if not folder then return end
+	for _, d in ipairs(folder:GetDescendants()) do
+		if d:IsA("Animation") then
+			local id = idOf(d.AnimationId)
+			if id then animMap[id] = {name = d.Name, kind = kind} end
+		end
+	end
+end
+indexFolder(RS:FindFirstChild("dodges"), "dodge")
+indexFolder(RS:FindFirstChild("anims"), "slap")
+for _, v in pairs(animMap) do
+	if v.name == "sit" or v.name == "default" then v.kind = "other" end
+	if v.kind == "slap" then nSlap = nSlap + 1 elseif v.kind == "dodge" then nDodge = nDodge + 1 end
+end
+local function classify(track)
+	local anim = track.Animation
+	local id = anim and idOf(anim.AnimationId)
+	local info = id and animMap[id]
+	if info then return info.kind, info.name end
+	local n = string.lower(track.Name or "")
+	for _, k in ipairs(SLAP_WORDS) do
+		if string.find(n, k, 1, true) then return "slap", track.Name end
+	end
+	return nil
+end
+
+local lastSlap, slapEvents, culprit, promptActive, histRows, histN = nil, {}, nil, false, {}, 0
+local worldHL
+local function thumb(plr, size) return ("rbxthumb://type=AvatarHeadShot&id=%d&w=%d&h=%d"):format(plr.UserId, size, size) end
+
+local function addHistory(plr, move)
+	histN = histN + 1
+	local row = mk("Frame", {Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = T.panel2, LayoutOrder = -histN}, histBox)
+	corner(row, 8)
+	local a = mk("ImageLabel", {Size = UDim2.fromOffset(22, 22), Position = UDim2.fromOffset(8, 5), BackgroundColor3 = T.off, Image = thumb(plr, 48)}, row)
+	corner(a, 11)
+	local n = label(row, plr.Name, 12, T.text, FB)
+	n.Position, n.Size = UDim2.fromOffset(38, 0), UDim2.new(0.45, -38, 1, 0)
+	local m = label(row, move, 12, T.sub, FM, Enum.TextXAlignment.Right)
+	m.Position, m.Size = UDim2.new(0.45, 0, 0, 0), UDim2.new(0.55, -70, 1, 0)
+	local tt = label(row, ts(), 10, T.sub, Enum.Font.Code, Enum.TextXAlignment.Right)
+	tt.Position, tt.Size = UDim2.new(1, -66, 0, 0), UDim2.new(0, 58, 1, 0)
+	histRows[#histRows + 1] = row
+	if #histRows > 20 then
+		table.remove(histRows, 1):Destroy()
+	end
+end
+
+local function refreshCulprit()
+	local e = culprit or (lastSlap and os.clock() - lastSlap.t < 60 and lastSlap) or nil
+	if not e then
+		cName.Text, cInfo.Text, av.Image = "Belum ada", "Menunggu slap...", ""
+	else
+		local p = e.plr
+		av.Image = thumb(p, 150)
+		cName.Text = (p.DisplayName == p.Name) and p.Name or (p.DisplayName .. " (@" .. p.Name .. ")")
+		cInfo.Text = ("%s | %s | %d dtk lalu"):format(e.move, e.src, math.floor(os.clock() - e.t))
+	end
+	cState.Text = promptActive and "PROMPT TEBAK AKTIF" or "STANDBY"
+	cState.TextColor3 = promptActive and T.good or T.warn
+	pillTrack(promptActive and "Pelacak: PROMPT" or ("Pelacak: " .. #slapEvents .. " slap"), promptActive and T.good or T.sub)
+end
+
+local function onSlap(plr, rawName)
+	local now = os.clock()
+	if lastSlap and lastSlap.plr == plr and now - lastSlap.t < 0.5 then return end
+	local move = PRETTY[rawName] or rawName
+	lastSlap = {plr = plr, move = move, t = now, src = "animasi"}
+	slapEvents[#slapEvents + 1] = lastSlap
+	if #slapEvents > 40 then table.remove(slapEvents, 1) end
+	addHistory(plr, move)
+	addLog(("slap terdeteksi: %s (%s)"):format(plr.Name, move), T.warn)
+	toast(("Slap oleh %s (%s)"):format(plr.Name, move), T.warn)
+	refreshCulprit()
+end
+
+local seenTrack = setmetatable({}, {__mode = "k"})
+task.spawn(function()
+	while alive do
+		task.wait(0.1)
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= LP and p.Character then
+				local hum = p.Character:FindFirstChildOfClass("Humanoid")
+				local an = hum and hum:FindFirstChildOfClass("Animator")
+				if an then
+					for _, tr in ipairs(an:GetPlayingAnimationTracks()) do
+						if not seenTrack[tr] then
+							seenTrack[tr] = true
+							local kind, name = classify(tr)
+							if kind == "slap" then onSlap(p, name) end
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+
+local function clearMarks()
+	if worldHL then
+		pcall(function() worldHL:Destroy() end)
+		worldHL = nil
+	end
+	local g = gameGui()
+	local sf = g and g:FindFirstChild("suspects")
+	if sf then
+		for _, b in ipairs(sf:GetChildren()) do
+			local m = b:FindFirstChild("SA_Mark")
+			if m then m:Destroy() end
+		end
+	end
+end
+local function findSuspectBtn(name)
+	local g = gameGui()
+	local sf = g and g:FindFirstChild("suspects")
+	if not sf then return nil end
+	for _, b in ipairs(sf:GetChildren()) do
+		if b:IsA("ImageButton") then
+			local n = b:FindFirstChild("name")
+			local ok, txt = pcall(function() return n.Text end)
+			if ok and txt == name then return b end
+		end
+	end
+end
+local function markCulprit(plr)
+	clearMarks()
+	local b = findSuspectBtn(plr.Name)
+	if b then mk("UIStroke", {Name = "SA_Mark", Color = T.good, Thickness = 4}, b) end
+	if S.worldHL and plr.Character and holder then
+		worldHL = mk("Highlight", {Adornee = plr.Character, FillColor = T.bad, OutlineColor = WHITE, FillTransparency = 0.6, DepthMode = Enum.HighlightDepthMode.AlwaysOnTop})
+		pcall(function() worldHL.Parent = holder end)
+	end
+end
+
+doGuess = function(manual)
+	local e = culprit
+	if not e then
+		if manual then toast("Pelaku belum terdeteksi", T.bad) end
+		return
+	end
+	local b = findSuspectBtn(e.plr.Name)
+	if b and pressBtn(b, "MouseButton1Click") then
+		addLog("menebak " .. e.plr.Name .. " (klik tombol suspects)", T.good)
+	else
+		R.Guess:FireServer(e.plr.Name)
+		addLog("menebak " .. e.plr.Name .. " (remote)", T.good)
+	end
+end
+
+keep(R.Guess.OnClientEvent:Connect(function(list)
+	if type(list) ~= "table" then
+		promptActive, culprit = false, nil
+		clearMarks()
+		refreshCulprit()
+		return
+	end
+	promptActive = true
+	culprit = nil
+	for i = #slapEvents, 1, -1 do
+		local e = slapEvents[i]
+		if os.clock() - e.t > 20 then break end
+		for _, p in pairs(list) do
+			if p == e.plr then culprit = e break end
+		end
+		if culprit then break end
+	end
+	refreshCulprit()
+	if culprit then
+		toast("PELAKU: " .. culprit.plr.Name, T.good)
+		addLog(("pelaku: %s (%s)"):format(culprit.plr.Name, culprit.move), T.good)
+		task.delay(0.25, function() if promptActive and culprit then markCulprit(culprit.plr) end end)
+		if S.autoGuess then
+			task.delay(0.8 + math.random() * 0.9, function() if promptActive then doGuess(false) end end)
+		end
+	else
+		toast("Pelaku tidak terdeteksi", T.bad)
+		addLog("pelaku tidak terdeteksi (animasi slap tidak terlihat)", T.bad)
+	end
+end))
+
+keep(R.Resety.OnClientEvent:Connect(function()
+	promptActive, culprit = false, nil
+	clearMarks()
+	refreshCulprit()
+end))
+
+task.spawn(function()
+	while alive do
+		task.wait(1)
+		pcall(refreshCulprit)
+	end
+end)
+
+---------------------------------------------------------------- WINDOW CONTROLS
+local fab = mk("TextButton", {Size = UDim2.fromOffset(42, 42), Position = UDim2.new(0, 14, 0.5, -60), Text = "S", TextColor3 = WHITE, Font = FB, TextSize = 18, AutoButtonColor = false}, gui)
+corner(fab, 21)
+onAccent(function() fab.BackgroundColor3 = T.accent end)
+makeDraggable(fab, fab, function() win.Visible = not win.Visible end)
+btnMin.Activated:Connect(function() win.Visible = false end)
+keep(UIS.InputBegan:Connect(function(i, gp)
+	if not gp and i.KeyCode == Enum.KeyCode.RightControl then win.Visible = not win.Visible end
+end))
+
+local function Unload()
+	alive = false
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	clearMarks()
+	pcall(function() gui:Destroy() end)
+	env.__SlapAssistant = nil
+end
+env.__SlapAssistant = {Unload = Unload}
+btnClose.Activated:Connect(Unload)
+
+---------------------------------------------------------------- INIT
+showTab("Dashboard")
+applyMode()
+refreshStats()
+refreshCulprit()
+addLog(("siap | indeks animasi: %d slap, %d dodge"):format(nSlap, nDodge), T.good)
+toast("Slap Assistant aktif", T.good)
